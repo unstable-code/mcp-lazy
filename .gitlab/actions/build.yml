@@ -1,0 +1,22 @@
+# Build stage jobs
+
+# Static binaries for every release target, in one job: cross-compiling is cheap and
+# the runner gains nothing from four containers. On a tag the version comes from the
+# tag, otherwise from the commit.
+build:binary:
+  stage: build
+  extends: .go
+  variables:
+    CGO_ENABLED: "0"
+  script:
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - VERSION="${VERSION:-$CI_COMMIT_SHORT_SHA}"
+    - |
+      for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+        GOOS=${target%/*} GOARCH=${target#*/} go build -trimpath \
+          -ldflags "-s -w -X main.version=$VERSION" \
+          -o "dist/lazymcp-${target%/*}-${target#*/}" ./cmd/lazymcp
+      done
+  artifacts:
+    paths: [dist/]
+    expire_in: 1 week

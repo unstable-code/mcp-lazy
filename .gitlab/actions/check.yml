@@ -1,0 +1,15 @@
+# Check stage jobs
+
+check:lint:
+  stage: check
+  extends: .go
+  script:
+    - test -z "$(gofmt -l .)" || { gofmt -d .; exit 1; }
+    - go vet ./...
+
+check:test:
+  stage: check
+  extends: .go
+  script:
+    # -race needs cgo; the golang image ships gcc.
+    - go test -race -count=1 ./...

@@ -1,93 +1,135 @@
 # mcp-lazy
 
+`lazymcp` wraps a stdio [MCP](https://modelcontextprotocol.io) server so that it is
+only started when a client actually uses it.
 
+MCP clients such as Claude Code start every configured stdio server when a session
+starts and keep it until the session ends, whether or not a single tool is called.
+With many sessions open (a terminal multiplexer restoring a dozen of them at once is
+enough), idle servers add up: one `npx chrome-devtools-mcp` costs three processes and
+about 35 MB resident plus ~285 MB swapped, per session.
 
-## Getting started
+With `lazymcp` in front, a session that never calls a tool holds one ~5 MB process and
+no server at all.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## How it works
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.gggames.synology.me/unstable-code/mcp-lazy.git
-git branch -M master
-git push -uf origin master
+client ──stdio── lazymcp ──stdio── server (started on first use)
 ```
 
-## Integrate with your tools
+1. **Before the server exists**, `lazymcp` answers the session-setup requests
+   (`server/discover`, `initialize`, `tools/list`, and the other list methods) from
+   answers it recorded from the same server in an earlier session. `ping` and
+   `logging/setLevel` are answered directly.
+2. **The first request it cannot answer** (normally the first `tools/call`) starts the
+   server. `lazymcp` replays the client's own `initialize`, `notifications/initialized`
+   and log level to it, swallows the server's answers (the client already has them),
+   then forwards the waiting request.
+3. **From then on** it relays bytes in both directions without parsing them. Requests
+   the server sends to the client (such as `roots/list`) pass through untouched.
 
-* [Set up project integrations](https://gitlab.gggames.synology.me/unstable-code/mcp-lazy/-/settings/integrations)
+The only cost is latency on that first tool call: the time the server needs to start
+(about 1.3 s for `chrome-devtools-mcp` with a warm npm cache).
 
-## Collaborate with your team
+### The cache
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+- One file per wrapped command line, under `--cache-dir`
+  (default `$XDG_CACHE_HOME/lazymcp`). Changing the server version or its flags changes
+  the command line, so it starts a fresh cache.
+- Keys include the protocol version, because servers echo the version the client asked
+  for in `initialize`.
+- A cold cache costs nothing extra: the server is started right away, exactly as without
+  `lazymcp`, and the answers are recorded on the way through.
+- Error answers are not recorded, except `-32601 Method not found`, which is a fixed
+  property of the server (it is how servers answer Claude Code's `server/discover`
+  probe).
+- When the server does start, `lazymcp` re-asks it any list the client got from the
+  cache. If the answer changed, the cache is corrected and the client receives
+  `notifications/tools/list_changed` (or the prompts/resources equivalent).
 
-## Test and Deploy
+### Process cleanup
 
-Use the built-in continuous integration in GitLab.
+The server runs in its own process group. When the client hangs up, `lazymcp` closes
+the server's stdin, waits up to 5 s, then sends `SIGTERM` (and `SIGKILL` after 2 s more)
+to the group. On Linux the server also gets `SIGTERM` from the kernel if `lazymcp` itself
+is killed (`PR_SET_PDEATHSIG`).
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
-
-***
-
-# Editing this README
-
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
-
-## Suggestions for a good README
-
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
-
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+Processes that move themselves into another group are left to their own parent-death
+handling, as they would be without `lazymcp`. For `chrome-devtools-mcp` that covers the
+telemetry watchdog and the browser: all 16 descendants were gone within 8 s after both a
+clean hang-up and `kill -9` of `lazymcp`.
 
 ## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+```
+lazymcp [OPTION]... -- COMMAND [ARG]...
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+      --cache-dir DIR  keep recorded server answers in DIR; empty disables the cache
+  -v, --verbose        log cache hits and recordings to stderr
+  -h, --help           show this help and exit
+      --version        print the version and exit
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+Claude Code (`.mcp.json`, or `claude mcp add`):
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+```json
+{
+  "mcpServers": {
+    "chrome-devtools": {
+      "type": "stdio",
+      "command": "lazymcp",
+      "args": ["--", "npx", "-y", "chrome-devtools-mcp@latest", "--no-usage-statistics"]
+    }
+  }
+}
+```
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+Tool names do not change: the client still sees the wrapped server's name and tools.
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+## Install
+
+Prebuilt binaries for linux and darwin (amd64, arm64) are attached to each
+[release](https://github.com/unstable-code/mcp-lazy/releases), with a `SHA256SUMS`
+file:
+
+```sh
+curl -fLO https://github.com/unstable-code/mcp-lazy/releases/latest/download/lazymcp-linux-amd64
+chmod +x lazymcp-linux-amd64 && mv lazymcp-linux-amd64 ~/.local/bin/lazymcp
+```
+
+Or build it:
+
+```sh
+nix run github:unstable-code/mcp-lazy -- --help
+go install github.com/unstable-code/mcp-lazy/cmd/lazymcp@latest
+```
+
+As a flake input, use `packages.<system>.default`. The binary is static
+(`CGO_ENABLED=0`) and uses the standard library only. Unix-like systems only; parent
+death signalling is Linux-only.
+
+## Development
+
+```sh
+nix develop          # go, gopls
+go test -race ./...
+```
+
+The tests replay the opening sequence captured from Claude Code 2.1.287 against
+`chrome-devtools-mcp` 1.3.0 (string and numeric ids, varying key order, a
+`server/discover` probe answered with `-32601`, server-initiated `roots/list`), plus a
+`tools/call` payload with quotes, escapes, Hangul and shell metacharacters that must
+reach the server byte for byte.
+
+## Limitations
+
+- stdio servers only.
+- A server whose list of tools depends on something other than its command line
+  (environment, files) can be served a stale list until it first starts; it is then
+  corrected via `list_changed`.
+- Paginated list requests (with a `cursor`) start the server.
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+[MIT](LICENSE)
